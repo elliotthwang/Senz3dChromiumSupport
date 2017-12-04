@@ -1,0 +1,433 @@
+From 3232c0c939ecf08943e380f7d64fe7da3c1ed131 Mon Sep 17 00:00:00 2001
+From: Qian Sun <qian.z.sun@intel.com>
+Date: Tue, 25 Feb 2014 18:17:40 +0800
+Subject: [PATCH 02/10] [Windows] Implement the VideoCaptureDeviceNuiWin based
+ on Kinect NUI API
+
+NUI is the Microsoft KinectSDK API to access video streams including color
+and depth streams on Windows OS.
+---
+ media/media.gyp                                    |   21 ++
+ media/video/capture/video_capture_device.h         |    3 +
+ .../win/video_capture_device_factory_win.cc        |   15 ++
+ .../capture/win/video_capture_device_nui_win.cc    |  238 ++++++++++++++++++++
+ .../capture/win/video_capture_device_nui_win.h     |   76 +++++++
+ 5 files changed, 353 insertions(+)
+ create mode 100644 media/video/capture/win/video_capture_device_nui_win.cc
+ create mode 100644 media/video/capture/win/video_capture_device_nui_win.h
+
+diff --git a/media/media.gyp b/media/media.gyp
+index d28b345..0f1afb6 100644
+--- a/media/media.gyp
++++ b/media/media.gyp
+@@ -45,6 +45,9 @@
+     # Use PxcCapture API (Intel PCSDK) on Windows to implement Video Capture
+     # Device.
+     'use_pxc_capture%': 0,
++    # Use NUI (Microsoft Kinect SDK) on Windows to implement Video Capture
++    # Device.
++    'use_nui_capture%': 0,
+   },
+   'includes': [
+     'media_cdm.gypi',
+@@ -579,6 +582,24 @@
+             ],
+           },
+         }],
++        ['OS=="win"' and 'use_nui_capture==1', {
++          'defines': ['USE_NUI_CAPTURE=1'],
++          'sources': [
++            'video/capture/win/video_capture_device_nui_win.cc',
++            'video/capture/win/video_capture_device_nui_win.h',
++          ],
++          'include_dirs': [
++            '<!(echo %KINECTSDK10_DIR%\\inc)',
++          ],
++          'link_settings': {
++            'library_dirs': [
++              '<!(echo %KINECTSDK10_DIR%\\lib\\x86)',
++            ],
++            'libraries': [
++              '-lKinect10.lib',
++            ],
++          },
++        }],
+         ['arm_neon==1', {
+           'defines': [
+             'USE_NEON'
+diff --git a/media/video/capture/video_capture_device.h b/media/video/capture/video_capture_device.h
+index 6c604e1..4bd725d 100644
+--- a/media/video/capture/video_capture_device.h
++++ b/media/video/capture/video_capture_device.h
+@@ -50,6 +50,9 @@ class MEDIA_EXPORT VideoCaptureDevice {
+ #if defined(USE_PXC_CAPTURE)
+       PXC_CAPTURE,
+ #endif
++#if defined(USE_NUI_CAPTURE)
++      NUI_CAPTURE,
++#endif
+       API_TYPE_UNKNOWN
+     };
+ #endif
+diff --git a/media/video/capture/win/video_capture_device_factory_win.cc b/media/video/capture/win/video_capture_device_factory_win.cc
+index e5feba8..2a49862 100644
+--- a/media/video/capture/win/video_capture_device_factory_win.cc
++++ b/media/video/capture/win/video_capture_device_factory_win.cc
+@@ -434,6 +434,15 @@ scoped_ptr<VideoCaptureDevice> VideoCaptureDeviceFactoryWin::Create(
+     if (!static_cast<VideoCaptureDevicePxcWin*>(device.get())->Init())
+       device.release();
+ #endif
++#if defined(USE_NUI_CAPTURE)
++  } else if (device_name.capture_api_type() ==
++             VideoCaptureDevice::Name::NUI_CAPTURE) {
++    DCHECK(VideoCaptureDeviceNuiWin::PlatformSupported());
++    device.reset(new VideoCaptureDeviceNuiWin(device_name));
++    DVLOG(1) << " NuiCapture Device: " << device_name.name();
++    if (!static_cast<VideoCaptureDeviceNuiWin*>(device.get())->Init())
++      device.release();
++#endif
+   } else {
+     NOTREACHED() << " Couldn't recognize VideoCaptureDevice type";
+   }
+@@ -446,6 +455,12 @@ void VideoCaptureDeviceFactoryWin::GetDeviceNames(
+   if (use_media_foundation_)
+     GetDeviceNamesMediaFoundation(device_names);
+   else {
++#if defined(USE_NUI_CAPTURE)
++    if (VideoCaptureDeviceNuiWin::PlatformSupported()) {
++      VideoCaptureDeviceNuiWin::GetDeviceNames(device_names);
++      return;
++    }
++#endif
+ #if defined(USE_PXC_CAPTURE)
+     if (VideoCaptureDevicePxcWin::PlatformSupported()) {
+       VideoCaptureDevicePxcWin::GetDeviceNames(device_names);
+diff --git a/media/video/capture/win/video_capture_device_nui_win.cc b/media/video/capture/win/video_capture_device_nui_win.cc
+new file mode 100644
+index 0000000..fbe715d
+--- /dev/null
++++ b/media/video/capture/win/video_capture_device_nui_win.cc
+@@ -0,0 +1,238 @@
++// Copyright (c) 2014 The Chromium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "media/video/capture/win/video_capture_device_nui_win.h"
++
++#include "base/bind.h"
++#include "base/logging.h"
++#include "base/strings/utf_string_conversions.h"
++
++namespace media {
++
++static const char kKinectColorDeviceName[] = "KinectColorStream";
++
++bool VideoCaptureDeviceNuiWin::PlatformSupported() {
++  int sensor_count = 0;
++  HRESULT result = NuiGetSensorCount(&sensor_count);
++  if (FAILED(result))
++    return false;
++  if (sensor_count <= 0)
++    return false;
++  return true;
++}
++
++void VideoCaptureDeviceNuiWin::GetDeviceNames(Names* device_names) {
++  device_names->clear();
++
++  int sensor_count = 0;
++  HRESULT result = NuiGetSensorCount(&sensor_count);
++  if (FAILED(result)) {
++    return;
++  }
++
++  if (sensor_count <= 0)
++    return;
++
++  Name name(kKinectColorDeviceName,
++            kKinectColorDeviceName,
++            Name::NUI_CAPTURE);
++  DLOG(INFO) << "Video capture device, " << name.name()
++             << " : " << name.id();
++  device_names->push_back(name);
++}
++
++VideoCaptureDeviceNuiWin::VideoCaptureDeviceNuiWin(const Name& device_name)
++    : state_(kIdle),
++      device_name_(device_name),
++      nui_capture_thread_("NuiCaptureThread"),
++      nui_sensor_(NULL),
++      nui_stream_handle_(INVALID_HANDLE_VALUE),
++      nui_nextframe_event_(INVALID_HANDLE_VALUE) {
++}
++
++VideoCaptureDeviceNuiWin::~VideoCaptureDeviceNuiWin() {
++}
++
++bool VideoCaptureDeviceNuiWin::Init() {
++  if (device_name_.name() != std::string(kKinectColorDeviceName))
++    return false;
++
++  int sensor_count = 0;
++  HRESULT result = NuiGetSensorCount(&sensor_count);
++  if (FAILED(result)) {
++    return false;
++  }
++
++  if (sensor_count <= 0)
++    return false;
++
++  INuiSensor *nui_sensor;
++  for (int i = 0; i < sensor_count; ++i) {
++    result = NuiCreateSensorByIndex(i, &nui_sensor);
++    if (FAILED(result)) {
++      continue;
++    }
++
++    result = nui_sensor->NuiStatus();
++    if (S_OK == result) {
++      nui_sensor_ = nui_sensor;
++      break;
++    }
++
++    nui_sensor->Release();
++  }
++
++  if (nui_sensor_ == NULL)
++    return false;
++
++  return true;
++}
++
++void VideoCaptureDeviceNuiWin::AllocateAndStart(
++    const VideoCaptureParams& params,
++    scoped_ptr<Client> client) {
++  if (nui_capture_thread_.IsRunning()) {
++    return;  // Wrong state.
++  }
++  nui_capture_thread_.Start();
++  nui_capture_thread_.message_loop()->PostTask(
++      FROM_HERE,
++      base::Bind(&VideoCaptureDeviceNuiWin::OnAllocateAndStart,
++                 base::Unretained(this),
++                 params.requested_format.frame_size.width(),
++                 params.requested_format.frame_size.height(),
++                 params.requested_format.frame_rate,
++                 base::Passed(&client)));
++}
++
++void VideoCaptureDeviceNuiWin::StopAndDeAllocate() {
++  if (!nui_capture_thread_.IsRunning()) {
++    return;  // Wrong state.
++  }
++  nui_capture_thread_.message_loop()->PostTask(
++      FROM_HERE,
++      base::Bind(&VideoCaptureDeviceNuiWin::OnStopAndDeAllocate,
++                 base::Unretained(this)));
++  nui_capture_thread_.Stop();
++}
++
++void VideoCaptureDeviceNuiWin::OnAllocateAndStart(
++    int width, int height, int frame_rate, scoped_ptr<Client> client) {
++  DCHECK_EQ(nui_capture_thread_.message_loop(), base::MessageLoop::current());
++
++  client_ = client.Pass();
++
++  HRESULT result = nui_sensor_->NuiInitialize(NUI_INITIALIZE_FLAG_USES_COLOR); 
++  if (SUCCEEDED(result)) {
++    nui_nextframe_event_ = CreateEvent(NULL, TRUE, FALSE, NULL);
++    result = nui_sensor_->NuiImageStreamOpen(
++        NUI_IMAGE_TYPE_COLOR,
++        NUI_IMAGE_RESOLUTION_640x480,
++        0,
++        2,
++        nui_nextframe_event_,
++        &nui_stream_handle_);
++
++    if (SUCCEEDED(result)) {
++      // TODO(nhu): fix the potential color conversions caused by hardcoding
++      //            PIXEL_FORMAT_ARGB.
++      DLOG(INFO) << "VideoCaptureFormat: "
++                 << " width = " << 640
++                 << " height = " << 480
++                 << " frame_rate = " << 30
++                 << " color = " << PIXEL_FORMAT_ARGB;
++
++        // Store our current width and height.
++      capture_format_.frame_size.SetSize(640,
++                                         480);
++      capture_format_.frame_rate = 30;
++      capture_format_.pixel_format = PIXEL_FORMAT_ARGB;
++
++      // Start capturing.
++      state_ = kCapturing;
++      nui_capture_thread_.message_loop()->PostTask(
++          FROM_HERE,
++          base::Bind(&VideoCaptureDeviceNuiWin::OnCaptureTask,
++                     base::Unretained(this)));
++      return;
++    }
++  }
++
++  SetErrorState("Cannot find appropriate stream.");
++}
++
++void VideoCaptureDeviceNuiWin::OnStopAndDeAllocate() {
++  DCHECK_EQ(nui_capture_thread_.message_loop(), base::MessageLoop::current());
++
++  state_ = kIdle;
++  if (nui_nextframe_event_ != INVALID_HANDLE_VALUE) {
++    CloseHandle(nui_nextframe_event_);
++  }
++
++  if (nui_stream_handle_ != INVALID_HANDLE_VALUE) {
++    CloseHandle(nui_stream_handle_);
++  }
++    
++  if (nui_sensor_ != NULL) {
++    nui_sensor_->NuiShutdown();
++    nui_sensor_->Release();
++    nui_sensor_ = NULL;
++  }
++
++  client_.reset();
++}
++
++void VideoCaptureDeviceNuiWin::OnCaptureTask() {
++  DCHECK_EQ(nui_capture_thread_.message_loop(), base::MessageLoop::current());
++
++  if (state_ != kCapturing)
++    return;
++
++  DWORD return_value;
++
++  return_value = WaitForSingleObject(nui_nextframe_event_, INFINITE);
++
++  if (return_value != WAIT_OBJECT_0) {
++    SetErrorState("next frame event error");
++    return;
++  }
++
++  NUI_IMAGE_FRAME nui_image_frame;
++  HRESULT  hresult = nui_sensor_->NuiImageStreamGetNextFrame(
++      nui_stream_handle_, 0, &nui_image_frame);
++  if (FAILED(hresult)) {
++    SetErrorState("get image frame error");
++    return;
++  }
++
++  INuiFrameTexture *nui_frame_texture = nui_image_frame.pFrameTexture;
++  NUI_LOCKED_RECT nui_lock_rect;
++
++  nui_frame_texture->LockRect(0, &nui_lock_rect, NULL, 0);
++
++  if (nui_lock_rect.Pitch != 0) {
++    int length = nui_lock_rect.size;
++    client_->OnIncomingCapturedFrame(
++        static_cast<uint8*> (nui_lock_rect.pBits),
++        length, base::TimeTicks::Now(), 0, capture_format_);
++  }
++
++  nui_frame_texture->UnlockRect(0);
++
++  nui_sensor_->NuiImageStreamReleaseFrame(nui_stream_handle_, &nui_image_frame);
++
++  nui_capture_thread_.message_loop()->PostTask(
++    FROM_HERE,
++    base::Bind(&VideoCaptureDeviceNuiWin::OnCaptureTask,
++               base::Unretained(this)));
++}
++
++void VideoCaptureDeviceNuiWin::SetErrorState(const std::string& reason) {
++  DVLOG(1) << reason;
++  state_ = kError;
++  client_->OnError(reason);
++}
++
++}  // namespace media
++
+diff --git a/media/video/capture/win/video_capture_device_nui_win.h b/media/video/capture/win/video_capture_device_nui_win.h
+new file mode 100644
+index 0000000..3c60a89
+--- /dev/null
++++ b/media/video/capture/win/video_capture_device_nui_win.h
+@@ -0,0 +1,76 @@
++// Copyright (c) 2014 The Chromium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef MEDIA_VIDEO_CAPTURE_WIN_VIDEO_CAPTURE_DEVICE_NUI_WIN_H_
++#define MEDIA_VIDEO_CAPTURE_WIN_VIDEO_CAPTURE_DEVICE_NUI_WIN_H_
++
++#include <Shlobj.h>
++#include "NuiApi.h"
++
++#include <string>
++
++#include "base/threading/thread.h"
++#include "media/video/capture/video_capture_device.h"
++#include "media/video/capture/video_capture_types.h"
++
++namespace media {
++
++// NUI based implementation of VideoCaptureDevice.
++
++class VideoCaptureDeviceNuiWin : public VideoCaptureDevice {
++ public:
++  explicit VideoCaptureDeviceNuiWin(const Name& device_name);
++  virtual ~VideoCaptureDeviceNuiWin();
++
++  // Create the device.
++  // This function is used by the static VideoCaptureDevice::Create function.
++  bool Init();
++
++  // VideoCaptureDevice implementation.
++  virtual void AllocateAndStart(const VideoCaptureParams& params,
++                                scoped_ptr<Client> client) OVERRIDE;
++
++  virtual void StopAndDeAllocate() OVERRIDE;
++
++  static bool PlatformSupported();
++
++  static void GetDeviceNames(Names* device_names);
++
++ private:
++  enum InternalState {
++    kIdle,  // The device is created but the camera is not in use.
++    kCapturing,  // Video is being captured.
++    kError  // Error reported by NUI API.
++  };
++
++  // Called on the nui_capture_thread_.
++  void OnAllocateAndStart(int width,
++                          int height,
++                          int frame_rate,
++                          scoped_ptr<Client> client);
++  void OnStopAndDeAllocate();
++  void OnCaptureTask();
++
++  void SetErrorState(const std::string& reason);
++
++  InternalState state_;
++  scoped_ptr<VideoCaptureDevice::Client> client_;
++  Name device_name_;
++
++  // Thread used for reading data from the device.
++  base::Thread nui_capture_thread_;
++
++  VideoCaptureFormat capture_format_;
++
++  INuiSensor *nui_sensor_;
++  HANDLE nui_stream_handle_;
++  HANDLE nui_nextframe_event_;
++
++  DISALLOW_IMPLICIT_CONSTRUCTORS(VideoCaptureDeviceNuiWin);
++};
++
++}  // namespace media
++
++#endif  // MEDIA_VIDEO_CAPTURE_WIN_VIDEO_CAPTURE_DEVICE_NUI_WIN_H_
++
+-- 
+1.7.9.5
+

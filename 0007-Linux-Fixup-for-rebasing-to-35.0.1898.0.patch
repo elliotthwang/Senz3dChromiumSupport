@@ -1,0 +1,68 @@
+From a6b675cae19afb7b9599c82e6e570fc2bdcf4f0f Mon Sep 17 00:00:00 2001
+From: Qian Sun <qian.z.sun@intel.com>
+Date: Thu, 27 Mar 2014 17:04:19 +0800
+Subject: [PATCH 07/10] [Linux] Fixup for rebasing to 35.0.1898.0
+
+---
+ .../renderer/media/media_stream_video_source.cc    |    5 +++++
+ .../capture/linux/video_capture_device_ds_linux.cc |   14 +++++++-------
+ 2 files changed, 12 insertions(+), 7 deletions(-)
+
+diff --git a/content/renderer/media/media_stream_video_source.cc b/content/renderer/media/media_stream_video_source.cc
+index 65ece68..399c9a0 100644
+--- a/content/renderer/media/media_stream_video_source.cc
++++ b/content/renderer/media/media_stream_video_source.cc
+@@ -148,6 +148,11 @@ bool UpdateFormatForConstraint(
+       constraint_name == kMediaStreamSourceId)
+     return true;
+ 
++  // Ignore Depth Stream constraints.
++  if (constraint_name == kMediaStreamDepth ||
++      constraint_name == kMediaStreamDepthRgbd)
++    return true;
++
+   if (constraint_name == MediaStreamVideoSource::kMinAspectRatio ||
+       constraint_name == MediaStreamVideoSource::kMaxAspectRatio) {
+     // These constraints are handled by cropping if the camera outputs the wrong
+diff --git a/media/video/capture/linux/video_capture_device_ds_linux.cc b/media/video/capture/linux/video_capture_device_ds_linux.cc
+index 992871d..35b1ace 100644
+--- a/media/video/capture/linux/video_capture_device_ds_linux.cc
++++ b/media/video/capture/linux/video_capture_device_ds_linux.cc
+@@ -390,8 +390,8 @@ void VideoCaptureDeviceDsLinux::OnError(const std::string& reason) {
+ void VideoCaptureDeviceDsLinux::OnColorImage(
+     int length, const uint8* yuy2) {
+   if (capture_mode_ == kCaptureColor) {
+-    client_->OnIncomingCapturedFrame(
+-        yuy2, length, base::TimeTicks::Now(), 0, capture_format_);
++    client_->OnIncomingCapturedData(
++        yuy2, length, capture_format_, 0, base::TimeTicks::Now());
+   } else if (capture_mode_ == kCaptureRGBD) {
+     uint8* yuy2_data = yuy2_image_.get();
+     memcpy(yuy2_data, yuy2, sizeof(uint8) * length);
+@@ -412,8 +412,8 @@ void VideoCaptureDeviceDsLinux::OnDepthImage(
+     } else if (depth_encoding_ == kAdaptiveRGB32) {
+       DepthToAdaptiveRGB32(depth_data, rgb_data, length);
+     }
+-    client_->OnIncomingCapturedFrame(
+-        rgb_data, rgb_size, base::TimeTicks::Now(), 0, capture_format_);
++    client_->OnIncomingCapturedData(
++        rgb_data, rgb_size, capture_format_, 0, base::TimeTicks::Now());
+   } else if (capture_mode_ == kCaptureRGBD) {
+     int calibrated_size = sizeof(uint8) * length * kBytesPerPixelYUY2;
+     uint8* calibrated_yuy2 = rgb32_image_.get();
+@@ -436,9 +436,9 @@ void VideoCaptureDeviceDsLinux::OnDepthImage(
+       calibrated_yuy2[index + 0] = yuy2[yuy2_index + 0];
+       calibrated_yuy2[index + 1] = yuy2[yuy2_index + 1];
+     }
+-    client_->OnIncomingCapturedFrame(
+-        calibrated_yuy2, calibrated_size,
+-         base::TimeTicks::Now(), 0, capture_format_);
++    client_->OnIncomingCapturedData(
++        calibrated_yuy2, calibrated_size, capture_format_,
++        0, base::TimeTicks::Now());
+   }
+ }
+ 
+-- 
+1.7.9.5
+

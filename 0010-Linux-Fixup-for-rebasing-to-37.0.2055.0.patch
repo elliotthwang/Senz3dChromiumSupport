@@ -1,0 +1,25 @@
+From c6b4a574b629a4ef6e151cdd38f7552081e254d5 Mon Sep 17 00:00:00 2001
+From: Qian Sun <qian.z.sun@intel.com>
+Date: Thu, 26 Jun 2014 23:27:27 -0400
+Subject: [PATCH 10/10] [Linux] Fixup for rebasing to 37.0.2055.0
+
+---
+ .../linux/video_capture_device_factory_linux.cc    |    2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/media/video/capture/linux/video_capture_device_factory_linux.cc b/media/video/capture/linux/video_capture_device_factory_linux.cc
+index ed9335d..b824056 100644
+--- a/media/video/capture/linux/video_capture_device_factory_linux.cc
++++ b/media/video/capture/linux/video_capture_device_factory_linux.cc
+@@ -63,7 +63,7 @@ scoped_ptr<VideoCaptureDevice> VideoCaptureDeviceFactoryLinux::Create(
+       device_name.id() == std::string("depth") ||
+       device_name.id() == std::string("rgbd")) {
+     if (VideoCaptureDeviceDsLinux::PlatformSupported())
+-      return new VideoCaptureDeviceDsLinux(device_name);
++      return scoped_ptr<VideoCaptureDevice>(new VideoCaptureDeviceDsLinux(device_name));
+   }
+ #endif
+ #if defined(OS_CHROMEOS)
+-- 
+1.7.9.5
+

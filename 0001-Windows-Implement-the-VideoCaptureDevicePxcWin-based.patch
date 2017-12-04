@@ -1,0 +1,563 @@
+From 559031df97a10116c392beacd38527a9f0a53c75 Mon Sep 17 00:00:00 2001
+From: Qian Sun <qian.z.sun@intel.com>
+Date: Tue, 29 Oct 2013 11:13:16 +0800
+Subject: [PATCH 01/10] [Windows] Implement the VideoCaptureDevicePxcWin based
+ on PXCCapture API
+
+PXCCapture is the Intel PCSDK API to access video streams including color
+and depth streams on Windows OS.
+
+VideoCaptureDevicePxcWin is the capture foundation to bring PerC capability
+to Crosswalk. It serves:
+- Capture color images for standard getUserMedia.
+- Capture depth images for experimental 'depth' extension of getUserMedia.
+- Avoid camera accessing confliction with other PXCCapture API clients.
+
+To build it in, please install the Intel PCSDK and append gyp definition
+"-Duse_pxc_capture=1" when generating the project.
+---
+ media/media.gyp                                    |   21 ++
+ media/video/capture/video_capture_device.h         |    3 +
+ .../win/video_capture_device_factory_win.cc        |   21 +-
+ .../capture/win/video_capture_device_pxc_win.cc    |  338 ++++++++++++++++++++
+ .../capture/win/video_capture_device_pxc_win.h     |   78 +++++
+ 5 files changed, 460 insertions(+), 1 deletion(-)
+ create mode 100644 media/video/capture/win/video_capture_device_pxc_win.cc
+ create mode 100644 media/video/capture/win/video_capture_device_pxc_win.h
+
+diff --git a/media/media.gyp b/media/media.gyp
+index 5670877..d28b345 100644
+--- a/media/media.gyp
++++ b/media/media.gyp
+@@ -42,6 +42,9 @@
+         'pkg-config': 'pkg-config'
+       }],
+     ],
++    # Use PxcCapture API (Intel PCSDK) on Windows to implement Video Capture
++    # Device.
++    'use_pxc_capture%': 0,
+   },
+   'includes': [
+     'media_cdm.gypi',
+@@ -558,6 +561,24 @@
+         ],
+       },
+       'conditions': [
++        ['OS=="win"' and 'use_pxc_capture==1', {
++          'defines': ['USE_PXC_CAPTURE=1'],
++          'sources': [
++            'video/capture/win/video_capture_device_pxc_win.cc',
++            'video/capture/win/video_capture_device_pxc_win.h',
++          ],
++          'include_dirs': [
++            '<!(echo %PCSDK_DIR%\include)',
++          ],
++          'link_settings': {
++            'library_dirs': [
++              '<!(echo %PCSDK_DIR%\lib\Win32)',
++            ],
++            'libraries': [
++              '-llibpxc.lib',
++            ],
++          },
++        }],
+         ['arm_neon==1', {
+           'defines': [
+             'USE_NEON'
+diff --git a/media/video/capture/video_capture_device.h b/media/video/capture/video_capture_device.h
+index afb4c35..6c604e1 100644
+--- a/media/video/capture/video_capture_device.h
++++ b/media/video/capture/video_capture_device.h
+@@ -47,6 +47,9 @@ class MEDIA_EXPORT VideoCaptureDevice {
+     enum CaptureApiType {
+       MEDIA_FOUNDATION,
+       DIRECT_SHOW,
++#if defined(USE_PXC_CAPTURE)
++      PXC_CAPTURE,
++#endif
+       API_TYPE_UNKNOWN
+     };
+ #endif
+diff --git a/media/video/capture/win/video_capture_device_factory_win.cc b/media/video/capture/win/video_capture_device_factory_win.cc
+index 96d764d..e5feba8 100644
+--- a/media/video/capture/win/video_capture_device_factory_win.cc
++++ b/media/video/capture/win/video_capture_device_factory_win.cc
+@@ -18,6 +18,9 @@
+ #include "media/base/media_switches.h"
+ #include "media/video/capture/win/video_capture_device_mf_win.h"
+ #include "media/video/capture/win/video_capture_device_win.h"
++#if defined(USE_PXC_CAPTURE)
++#include "media/video/capture/win/video_capture_device_pxc_win.h"
++#endif
+ 
+ using base::win::ScopedCoMem;
+ using base::win::ScopedComPtr;
+@@ -422,6 +425,15 @@ scoped_ptr<VideoCaptureDevice> VideoCaptureDeviceFactoryWin::Create(
+     }
+     if (!static_cast<VideoCaptureDeviceWin*>(device.get())->Init(source))
+       device.reset();
++#if defined(USE_PXC_CAPTURE)
++  } else if (device_name.capture_api_type() ==
++             VideoCaptureDevice::Name::PXC_CAPTURE) {
++    DCHECK(VideoCaptureDevicePxcWin::PlatformSupported());
++    device.reset(new VideoCaptureDevicePxcWin(device_name));
++    DVLOG(1) << " PxcCapture Device: " << device_name.name();
++    if (!static_cast<VideoCaptureDevicePxcWin*>(device.get())->Init())
++      device.release();
++#endif
+   } else {
+    DCHECK_EQ(device_name.capture_api_type(),
+              VideoCaptureDevice::Name::DIRECT_SHOW);
+    device.reset(new VideoCaptureDeviceWin(device_name));
+    DVLOG(1) << " DirectShow Device: " << device_name.name();
+    if (!static_cast<VideoCaptureDeviceWin*>(device.get())->Init())
+      device.reset();
+   }
+@@ -433,8 +445,15 @@ void VideoCaptureDeviceFactoryWin::GetDeviceNames(
+   DCHECK(thread_checker_.CalledOnValidThread());
+   if (use_media_foundation_)
+     GetDeviceNamesMediaFoundation(device_names);
+-  else
++  else {
++#if defined(USE_PXC_CAPTURE)
++    if (VideoCaptureDevicePxcWin::PlatformSupported()) {
++      VideoCaptureDevicePxcWin::GetDeviceNames(device_names);
++      return;
++    }
++#endif
+     GetDeviceNamesDirectShow(device_names);
++  }
+}
+ 
+ void VideoCaptureDeviceFactoryWin::GetDeviceSupportedFormats(
+diff --git a/media/video/capture/win/video_capture_device_pxc_win.cc b/media/video/capture/win/video_capture_device_pxc_win.cc
+new file mode 100644
+index 0000000..53ae4c1
+--- /dev/null
++++ b/media/video/capture/win/video_capture_device_pxc_win.cc
+@@ -0,0 +1,338 @@
++// Copyright (c) 2013 The Chromium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "media/video/capture/win/video_capture_device_pxc_win.h"
++
++#include "base/bind.h"
++#include "base/logging.h"
++#include "base/strings/utf_string_conversions.h"
++
++namespace media {
++
++static const size_t kBytesPerPixelRGB32 = 4;
++
++// Release a PXCSession will call CoUninitiliaze which causes calling thread
++// (Audio Thread) to fail on COM API calling. Hold a global PXCSession to avoid
++// this.
++static PXCSmartPtr<PXCSession> g_session;
++
++bool VideoCaptureDevicePxcWin::PlatformSupported() {
++  if (g_session.IsValid())
++    return true;
++
++  pxcStatus status = PXCSession_Create(&g_session);
++  if (status < PXC_STATUS_NO_ERROR) {
++    DLOG(ERROR) << "Failed to create a PXC Session.";
++    return false;
++  }
++  return true;
++}
++
++void VideoCaptureDevicePxcWin::GetDeviceNames(Names* device_names) {
++  device_names->clear();
++
++  if (!VideoCaptureDevicePxcWin::PlatformSupported())
++    return;
++
++  pxcStatus status;
++  PXCSession::ImplDesc video_capture_desc;
++  memset(&video_capture_desc, 0, sizeof(video_capture_desc));
++  video_capture_desc.group = PXCSession::IMPL_GROUP_SENSOR;
++  video_capture_desc.subgroup = PXCSession::IMPL_SUBGROUP_VIDEO_CAPTURE;
++  for (int module_index = 0; ; module_index++) {
++    PXCSession::ImplDesc desc;
++    status = g_session->QueryImpl(&video_capture_desc, module_index, &desc);
++    if (status < PXC_STATUS_NO_ERROR)
++      break;
++
++    PXCSmartPtr<PXCCapture> capture;
++    status = g_session->CreateImpl<PXCCapture>(&desc, &capture);
++    if (status < PXC_STATUS_NO_ERROR)
++      continue;
++
++    for (int device_index = 0; ; device_index++) {
++      PXCCapture::DeviceInfo device_info;
++      status = capture->QueryDevice(device_index, &device_info);
++      if (status < PXC_STATUS_NO_ERROR)
++        break;
++
++      PXCSmartPtr<PXCCapture::Device> capture_device;
++      status = capture->CreateDevice(device_index, &capture_device);
++      if (status < PXC_STATUS_NO_ERROR)
++        continue;
++
++      bool found_color_stream = false;
++      for (int stream_index = 0; ; stream_index++) {
++        PXCCapture::Device::StreamInfo stream_info;
++        status = capture_device->QueryStream(stream_index, &stream_info);
++        if (status < PXC_STATUS_NO_ERROR)
++          break;
++
++        if (stream_info.cuid == PXCCapture::VideoStream::CUID &&
++            stream_info.imageType == PXCImage::IMAGE_TYPE_COLOR) {
++          found_color_stream = true;
++          break;
++        }
++      }
++
++      if (found_color_stream) {
++        Name name(base::WideToUTF8(std::wstring(device_info.name)),
++                  base::WideToUTF8(std::wstring(device_info.did)),
++                  Name::PXC_CAPTURE);
++        DLOG(INFO) << "Video capture device, " << name.name()
++                   << " : " << name.id();
++        device_names->push_back(name);
++      }
++    }  // Enumerate devices.
++  }  // Enumerate modules.
++}
++
++VideoCaptureDevicePxcWin::VideoCaptureDevicePxcWin(const Name& device_name)
++    : state_(kIdle),
++      device_name_(device_name),
++      pxc_capture_thread_("PxcCaptureThread") {
++}
++
++VideoCaptureDevicePxcWin::~VideoCaptureDevicePxcWin() {
++}
++
++bool VideoCaptureDevicePxcWin::Init() {
++  pxcStatus status;
++  PXCSession::ImplDesc video_capture_desc;
++  memset(&video_capture_desc, 0, sizeof(video_capture_desc));
++  video_capture_desc.group = PXCSession::IMPL_GROUP_SENSOR;
++  video_capture_desc.subgroup = PXCSession::IMPL_SUBGROUP_VIDEO_CAPTURE;
++  for (int module_index = 0; ; module_index++) {
++    PXCSession::ImplDesc desc;
++    status = g_session->QueryImpl(&video_capture_desc, module_index, &desc);
++    if (status < PXC_STATUS_NO_ERROR) {
++      // No more modules.
++      break;
++    }
++
++    PXCSmartPtr<PXCCapture> capture;
++    status = g_session->CreateImpl<PXCCapture>(&desc, &capture);
++    if (status < PXC_STATUS_NO_ERROR) {
++      continue;
++    }
++
++    for (int device_index = 0; ; device_index++) {
++      PXCCapture::DeviceInfo device_info;
++      status = capture->QueryDevice(device_index, &device_info);
++      if (status < PXC_STATUS_NO_ERROR) {
++        // No more devices.
++        break;
++      }
++
++      if (base::WideToUTF8(std::wstring(device_info.name)) != device_name_.name() ||
++          base::WideToUTF8(std::wstring(device_info.did)) != device_name_.id())
++        continue;
++
++      PXCSmartPtr<PXCCapture::Device> device;
++      status = capture->CreateDevice(device_index, &device);
++      if (status < PXC_STATUS_NO_ERROR)
++        break;
++
++      DLOG(INFO) << "Device is created: "
++                 << device_info.name << device_info.did;
++      device_ = device.ReleasePtr();
++      return true;
++    }  // Enumerate capture devices.
++  }  // Enumerate the video capture modules.
++  return false;
++}
++
++void VideoCaptureDevicePxcWin::AllocateAndStart(
++    const VideoCaptureParams& params,
++    scoped_ptr<Client> client) {
++  if (pxc_capture_thread_.IsRunning()) {
++    return;  // Wrong state.
++  }
++  pxc_capture_thread_.Start();
++  pxc_capture_thread_.message_loop()->PostTask(
++      FROM_HERE,
++      base::Bind(&VideoCaptureDevicePxcWin::OnAllocateAndStart,
++                 base::Unretained(this),
++                 params.requested_format.frame_size.width(),
++                 params.requested_format.frame_size.height(),
++                 params.requested_format.frame_rate,
++                 base::Passed(&client)));
++}
++
++void VideoCaptureDevicePxcWin::StopAndDeAllocate() {
++  if (!pxc_capture_thread_.IsRunning()) {
++    return;  // Wrong state.
++  }
++  pxc_capture_thread_.message_loop()->PostTask(
++      FROM_HERE,
++      base::Bind(&VideoCaptureDevicePxcWin::OnStopAndDeAllocate,
++                 base::Unretained(this)));
++  pxc_capture_thread_.Stop();
++}
++
++void VideoCaptureDevicePxcWin::OnAllocateAndStart(
++    int width, int height, int frame_rate, scoped_ptr<Client> client) {
++  DCHECK_EQ(pxc_capture_thread_.message_loop(), base::MessageLoop::current());
++
++  client_ = client.Pass();
++
++  if (!device_.IsValid()) {
++    SetErrorState("No capture device is initialized.");
++  }
++
++  pxcStatus status;
++  for (int stream_index = 0; ; stream_index++) {
++    PXCCapture::Device::StreamInfo stream_info;
++    status = device_->QueryStream(stream_index, &stream_info);
++    if (status < PXC_STATUS_NO_ERROR) {
++      // No more streams.
++      break;
++    }
++
++    if (stream_info.cuid != PXCCapture::VideoStream::CUID ||
++        stream_info.imageType != PXCImage::IMAGE_TYPE_COLOR)
++      continue;
++
++    PXCSmartPtr<PXCCapture::VideoStream> stream;
++    status =
++        device_->CreateStream<PXCCapture::VideoStream>(stream_index,
++                                                              &stream);
++    if (status < PXC_STATUS_NO_ERROR)
++      continue;
++
++    // Find the best profile.
++    PXCCapture::VideoStream::ProfileInfo best_profile;
++    bool best_profile_found = false;
++    uint32 best = 0xFFFFFFFF;
++    for (int porfile_index = 0; !stream_.IsValid(); porfile_index++) {
++      PXCCapture::VideoStream::ProfileInfo video_profile;
++      status = stream->QueryProfile(porfile_index, &video_profile);
++      if (status < PXC_STATUS_NO_ERROR) {
++        // No more profiles.
++        break;
++      }
++
++      uint32 frameRateMin =
++          video_profile.frameRateMin.denominator ?
++              video_profile.frameRateMin.numerator /
++                  video_profile.frameRateMin.denominator
++                      : 0;
++      uint32 frameRateMax =
++          video_profile.frameRateMax.denominator ?
++              video_profile.frameRateMax.numerator /
++                  video_profile.frameRateMax.denominator
++                      : 0;
++      uint32 current =
++          abs(static_cast<int>(width - video_profile.imageInfo.width)) +
++          abs(static_cast<int>(height - video_profile.imageInfo.height)) +
++          abs(static_cast<int>(frame_rate - frameRateMin)) +
++          abs(static_cast<int>(frame_rate - frameRateMax));
++
++      if (current < best) {
++        best = current;
++        best_profile_found = true;
++        best_profile = video_profile;
++      }
++    }  // Enumerate profiles.
++
++    if (!best_profile_found)
++      continue;
++
++    status = stream->SetProfile(&best_profile);
++    if (status < PXC_STATUS_NO_ERROR)
++      break;
++    stream_ = stream.ReleasePtr();
++
++    // TODO(nhu): fix the potential color conversions caused by hardcoding
++    //            PIXEL_FORMAT_ARGB.
++    DLOG(INFO) << "VideoCaptureFormat: "
++               << " width = " << best_profile.imageInfo.width
++               << " height = " << best_profile.imageInfo.height
++               << " frame_rate = " << frame_rate
++               << " color = " << PIXEL_FORMAT_ARGB;
++
++      // Store our current width and height.
++    capture_format_.frame_size.SetSize(best_profile.imageInfo.width,
++                                       best_profile.imageInfo.height);
++    capture_format_.frame_rate = frame_rate;
++    capture_format_.pixel_format = PIXEL_FORMAT_ARGB;
++
++    // Start capturing.
++    state_ = kCapturing;
++    pxc_capture_thread_.message_loop()->PostTask(
++        FROM_HERE,
++        base::Bind(&VideoCaptureDevicePxcWin::OnCaptureTask,
++                   base::Unretained(this)));
++    return;
++  }  // Enumrate streams.
++  SetErrorState("Cannot find appropriate stream.");
++}
++
++void VideoCaptureDevicePxcWin::OnStopAndDeAllocate() {
++  DCHECK_EQ(pxc_capture_thread_.message_loop(), base::MessageLoop::current());
++
++  state_ = kIdle;
++  stream_.ReleaseRef();
++  device_.ReleaseRef();
++  client_.reset();
++}
++
++void VideoCaptureDevicePxcWin::OnCaptureTask() {
++  DCHECK_EQ(pxc_capture_thread_.message_loop(), base::MessageLoop::current());
++
++  if (state_ != kCapturing || !stream_.IsValid())
++    return;
++
++  PXCSmartSP sp;
++  PXCSmartPtr<PXCImage> image;
++  pxcStatus status = stream_->ReadStreamAsync(&image, &sp);
++  if (status < PXC_STATUS_NO_ERROR) {
++    SetErrorState("Read stream error");
++    return;
++  }
++
++  status = sp->Synchronize();
++  if (status < PXC_STATUS_NO_ERROR) {
++    SetErrorState("Read synchronization EOF");
++    return;
++  }
++
++  PXCImage::ImageInfo info;
++  status = image->QueryInfo(&info);
++  if (status < PXC_STATUS_NO_ERROR) {
++    SetErrorState("Get image info error");
++    return;
++  }
++
++  PXCImage::ImageData data;
++  status = image->AcquireAccess(
++      PXCImage::ACCESS_READ, PXCImage::COLOR_FORMAT_RGB32, &data);
++  if (status < PXC_STATUS_NO_ERROR) {
++    SetErrorState("Access image data error");
++    return;
++  }
++
++  DCHECK_EQ(data.type, PXCImage::SURFACE_TYPE_SYSTEM_MEMORY);
++
++  int length = info.width * info.height * kBytesPerPixelRGB32;
++  client_->OnIncomingCapturedFrame(
++      static_cast<uint8*> (data.planes[0]),
++      length, base::TimeTicks::Now(), 0, capture_format_);
++
++  image->ReleaseAccess(&data);
++
++  pxc_capture_thread_.message_loop()->PostTask(
++    FROM_HERE,
++    base::Bind(&VideoCaptureDevicePxcWin::OnCaptureTask,
++               base::Unretained(this)));
++}
++
++void VideoCaptureDevicePxcWin::SetErrorState(const std::string& reason) {
++  DVLOG(1) << reason;
++  state_ = kError;
++  client_->OnError(reason);
++}
++
++}  // namespace media
++
+diff --git a/media/video/capture/win/video_capture_device_pxc_win.h b/media/video/capture/win/video_capture_device_pxc_win.h
+new file mode 100644
+index 0000000..d51fc0b
+--- /dev/null
++++ b/media/video/capture/win/video_capture_device_pxc_win.h
+@@ -0,0 +1,78 @@
++// Copyright (c) 2013 The Chromium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef MEDIA_VIDEO_CAPTURE_WIN_VIDEO_CAPTURE_DEVICE_PXC_WIN_H_
++#define MEDIA_VIDEO_CAPTURE_WIN_VIDEO_CAPTURE_DEVICE_PXC_WIN_H_
++
++#include <string>
++
++#include "pxccapture.h"  // NOLINT(*)
++#include "pxcgesture.h"  // NOLINT(*)
++#include "pxcsmartptr.h"  // NOLINT(*)
++
++#include "base/threading/thread.h"
++#include "media/video/capture/video_capture_device.h"
++#include "media/video/capture/video_capture_types.h"
++
++namespace media {
++
++// PXCCapture based implementation of VideoCaptureDevice.
++// PXCCapture does not provide its own thread for capturing so this
++// implementation uses a Chromium thread for fetching frames.
++
++class VideoCaptureDevicePxcWin : public VideoCaptureDevice {
++ public:
++  explicit VideoCaptureDevicePxcWin(const Name& device_name);
++  virtual ~VideoCaptureDevicePxcWin();
++
++  // Create the PXCCapture::Device.
++  // This function is used by the static VideoCaptureDevice::Create function.
++  bool Init();
++
++  // VideoCaptureDevice implementation.
++  virtual void AllocateAndStart(const VideoCaptureParams& params,
++                                scoped_ptr<Client> client) OVERRIDE;
++
++  virtual void StopAndDeAllocate() OVERRIDE;
++
++  static bool PlatformSupported();
++
++  static void GetDeviceNames(Names* device_names);
++
++ private:
++  enum InternalState {
++    kIdle,  // The device is created but the camera is not in use.
++    kCapturing,  // Video is being captured.
++    kError  // Error reported by PXCCapture API.
++  };
++
++  // Called on the pxc_capture_thread_.
++  void OnAllocateAndStart(int width,
++                          int height,
++                          int frame_rate,
++                          scoped_ptr<Client> client);
++  void OnStopAndDeAllocate();
++  void OnCaptureTask();
++
++  void SetErrorState(const std::string& reason);
++
++  InternalState state_;
++  scoped_ptr<VideoCaptureDevice::Client> client_;
++  Name device_name_;
++
++  // Thread used for reading data from the device.
++  base::Thread pxc_capture_thread_;
++
++  PXCSmartPtr<PXCCapture::Device> device_;
++  PXCSmartPtr<PXCCapture::VideoStream> stream_;
++
++  VideoCaptureFormat capture_format_;
++
++  DISALLOW_IMPLICIT_CONSTRUCTORS(VideoCaptureDevicePxcWin);
++};
++
++}  // namespace media
++
++#endif  // MEDIA_VIDEO_CAPTURE_WIN_VIDEO_CAPTURE_DEVICE_PXC_WIN_H_
++
+-- 
+1.7.9.5
+

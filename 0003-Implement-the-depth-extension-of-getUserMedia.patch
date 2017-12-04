@@ -1,0 +1,558 @@
+From e1db54898f8c9df3067932f23405ea900d345b4c Mon Sep 17 00:00:00 2001
+From: Qian Sun <qian.z.sun@intel.com>
+Date: Wed, 25 Dec 2013 22:25:58 +0800
+Subject: [PATCH 03/10] Implement the 'depth' extension of getUserMedia
+
+Web app is able to set 'depth' video mandatory constraint as
+true to request a depth video capture via getUserMedia. e.g.
+
+    getUserMedia(
+        {video: {'mandatory': {'depth': true}}},
+        successCallback, errorCallback);
+
+Currently, the depth image (16bit-per-pixel) is encoded into
+RGB format (3x8bit).
+
+There are three encoding options:
+1. 'grayscale': convert depth image into 8-bit
+   grayscale image. The algorithm is based on equation (4) in paper
+   "3-D Video Representation Using Depth Maps".
+2. 'adaptive': implement depth encoding scheme proposed in paper
+   "Adapting Standard Video Codecs for Depth Streaming" [depth-streaming].
+3. 'raw': map 16bit depth pixel into 3 8-bit channels which is based
+   on BIT2 scheme in paper [depth-streaming].
+
+Set the encoding schema via '--depth-encoding' switch.
+---
+ .../renderer_host/media/media_stream_manager.cc    |   17 ++
+ content/common/media/media_stream_options.cc       |    1 +
+ content/common/media/media_stream_options.h        |    1 +
+ content/renderer/media/rtc_media_constraints.cc    |    4 +-
+ media/base/media_switches.cc                       |    7 +
+ media/base/media_switches.h                        |    4 +
+ .../capture/win/video_capture_device_pxc_win.cc    |  242 ++++++++++++++++++--
+ .../capture/win/video_capture_device_pxc_win.h     |   32 ++-
+ 8 files changed, 291 insertions(+), 17 deletions(-)
+
+diff --git a/content/browser/renderer_host/media/media_stream_manager.cc b/content/browser/renderer_host/media/media_stream_manager.cc
+index 9a2779b..a6c0de0 100644
+--- a/content/browser/renderer_host/media/media_stream_manager.cc
++++ b/content/browser/renderer_host/media/media_stream_manager.cc
+@@ -1258,6 +1258,23 @@ bool MediaStreamManager::SetupDeviceCaptureRequest(DeviceRequest* request) {
+                                    &video_device_id)) {
+     return false;
+   }
++
++  // Handle depth video capture constraint
++  if (request->video_type() == MEDIA_DEVICE_VIDEO_CAPTURE) {
++    std::string depth_constraint;
++    bool mandatory = true;
++    request->options.GetFirstVideoConstraintByName(kMediaStreamDepth,
++                                                   &depth_constraint,
++                                                   &mandatory);
++    if (depth_constraint == "true") {
++      // If a depth video capture device would like to support 'depth'
++      // constraint in getUserMedia. It needs to set kMediaStreamDepth as
++      // device ID.
++      // This is a temporary solution.
++      // TODO(nhu): fix it in formal depth video capture device infrastructure.
++      video_device_id = kMediaStreamDepth;
++    }
++  }
+   request->CreateUIRequest(audio_device_id, video_device_id);
+   DVLOG(3) << "Audio requested " << request->options.audio_requested
+            << " device id = " << audio_device_id
+diff --git a/content/common/media/media_stream_options.cc b/content/common/media/media_stream_options.cc
+index c727b63..cd344ef 100644
+--- a/content/common/media/media_stream_options.cc
++++ b/content/common/media/media_stream_options.cc
+@@ -20,6 +20,7 @@ const char kMediaStreamRenderToAssociatedSink[] =
+ // The prefix of this constant is 'goog' to match with other getUserMedia
+ // constraints for audio.
+ const char kMediaStreamAudioDucking[] = "googDucking";
++const char kMediaStreamDepth[] = "depth";
+ 
+ namespace {
+ 
+diff --git a/content/common/media/media_stream_options.h b/content/common/media/media_stream_options.h
+index e58f137..77c09db 100644
+--- a/content/common/media/media_stream_options.h
++++ b/content/common/media/media_stream_options.h
+@@ -21,6 +21,7 @@ CONTENT_EXPORT extern const char kMediaStreamSourceTab[];
+ CONTENT_EXPORT extern const char kMediaStreamSourceScreen[];
+ CONTENT_EXPORT extern const char kMediaStreamSourceDesktop[];
+ CONTENT_EXPORT extern const char kMediaStreamSourceSystem[];
++CONTENT_EXPORT extern const char kMediaStreamDepth[];
+ 
+ // Experimental constraint to do device matching.  When this optional constraint
+ // is set, WebRTC audio renderer will render audio from media streams to an
+diff --git a/content/renderer/media/rtc_media_constraints.cc b/content/renderer/media/rtc_media_constraints.cc
+index 7f8b79d..2b3f4ff 100644
+--- a/content/renderer/media/rtc_media_constraints.cc
++++ b/content/renderer/media/rtc_media_constraints.cc
+@@ -26,8 +26,10 @@ void GetNativeMediaConstraints(
+     new_constraint.value = constraints[i].m_value.utf8();
+ 
+     // Ignore Chrome specific Tab capture constraints.
++    // Ignore depth video constraint.
+     if (new_constraint.key == kMediaStreamSource ||
+-        new_constraint.key == kMediaStreamSourceId)
++        new_constraint.key == kMediaStreamSourceId ||
++        new_constraint.key == kMediaStreamDepth)
+       continue;
+ 
+     // Ignore sourceId constraint since that has nothing to do with webrtc.
+diff --git a/media/base/media_switches.cc b/media/base/media_switches.cc
+index 1bb5e98..4a13c6c 100644
+--- a/media/base/media_switches.cc
++++ b/media/base/media_switches.cc
+@@ -94,4 +94,11 @@ const char kUseFakeDeviceForMediaStream[] = "use-fake-device-for-media-stream";
+ // Use a raw video file as fake video capture device.
+ const char kUseFileForFakeVideoCapture[] = "use-file-for-fake-video-capture";
+ 
++#if defined(OS_WIN) && defined(USE_PXC_CAPTURE)
++// Define the depth image encoding in RGB32 format.
++// Options are "grayscale", "raw" and "adaptive". The default is "grayscale".
++const char kDepthEncoding[] = "depth-encoding";
++#endif
++
++
+ }  // namespace switches
+diff --git a/media/base/media_switches.h b/media/base/media_switches.h
+index df621a0..1b8c5cf 100644
+--- a/media/base/media_switches.h
++++ b/media/base/media_switches.h
+@@ -50,6 +50,10 @@ MEDIA_EXPORT extern const char kUseCras[];
+ MEDIA_EXPORT extern const char kUseFakeDeviceForMediaStream[];
+ MEDIA_EXPORT extern const char kUseFileForFakeVideoCapture[];
+ 
++#if defined(OS_WIN) && defined(USE_PXC_CAPTURE)
++MEDIA_EXPORT extern const char kDepthEncoding[];
++#endif
++
+ }  // namespace switches
+ 
+ #endif  // MEDIA_BASE_MEDIA_SWITCHES_H_
+diff --git a/media/video/capture/win/video_capture_device_pxc_win.cc b/media/video/capture/win/video_capture_device_pxc_win.cc
+index 53ae4c1..a325cab 100644
+--- a/media/video/capture/win/video_capture_device_pxc_win.cc
++++ b/media/video/capture/win/video_capture_device_pxc_win.cc
+@@ -5,18 +5,36 @@
+ #include "media/video/capture/win/video_capture_device_pxc_win.h"
+ 
+ #include "base/bind.h"
++#include "base/command_line.h"
+ #include "base/logging.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "media/base/media_switches.h"
+ 
+ namespace media {
+ 
++// This needs to be aligned with definition in
++// content/renderer/media/media_stream_impl.cc
++const char kVirtualDepthDeviceId[] = "depth";
++
+ static const size_t kBytesPerPixelRGB32 = 4;
+ 
++// TODO(nhu): the min and max depth value should be obtained from PCSDK API.
++static const int kMinDepthValue = 150;
++static const int kMaxDepthValue = 3000;
++
++// Depth encoding in RGB32
++const char kDepthEncodingGrayscale[] = "grayscale";
++const char kDepthEncodingRaw[] = "raw";
++const char kDepthEncodingAdaptive[] = "adaptive";
++
+ // Release a PXCSession will call CoUninitiliaze which causes calling thread
+ // (Audio Thread) to fail on COM API calling. Hold a global PXCSession to avoid
+ // this.
+ static PXCSmartPtr<PXCSession> g_session;
+ 
++// Map the virtual depth camera ID to real one.
++std::string g_real_depth_device_id;
++
+ bool VideoCaptureDevicePxcWin::PlatformSupported() {
+   if (g_session.IsValid())
+     return true;
+@@ -63,35 +81,63 @@ void VideoCaptureDevicePxcWin::GetDeviceNames(Names* device_names) {
+         continue;
+ 
+       bool found_color_stream = false;
++      bool found_depth_stream = false;
+       for (int stream_index = 0; ; stream_index++) {
+         PXCCapture::Device::StreamInfo stream_info;
+         status = capture_device->QueryStream(stream_index, &stream_info);
+         if (status < PXC_STATUS_NO_ERROR)
+           break;
+ 
+-        if (stream_info.cuid == PXCCapture::VideoStream::CUID &&
+-            stream_info.imageType == PXCImage::IMAGE_TYPE_COLOR) {
+-          found_color_stream = true;
+-          break;
+-        }
++        if (stream_info.cuid == PXCCapture::VideoStream::CUID)
++          if (stream_info.imageType == PXCImage::IMAGE_TYPE_COLOR) {
++            found_color_stream = true;
++          } else if (stream_info.imageType == PXCImage::IMAGE_TYPE_DEPTH) {
++            found_depth_stream = true;
++          }
+       }
+ 
+       if (found_color_stream) {
+         Name name(base::WideToUTF8(std::wstring(device_info.name)),
+                   base::WideToUTF8(std::wstring(device_info.did)),
+                   Name::PXC_CAPTURE);
+-        DLOG(INFO) << "Video capture device, " << name.name()
++        DLOG(INFO) << "Color video capture device, " << name.name()
+                    << " : " << name.id();
+         device_names->push_back(name);
+       }
++      if (found_depth_stream) {
++        Name name(base::WideToUTF8(std::wstring(device_info.name)),
++                  kVirtualDepthDeviceId,
++                  Name::PXC_CAPTURE);
++        DLOG(INFO) << "Depth video capture device, " << name.name()
++                   << " : " << name.id();
++        g_real_depth_device_id = base::WideToUTF8(std::wstring(device_info.did));
++        device_names->push_back(name);
++      }
+     }  // Enumerate devices.
+   }  // Enumerate modules.
+ }
+ 
+ VideoCaptureDevicePxcWin::VideoCaptureDevicePxcWin(const Name& device_name)
+-    : state_(kIdle),
++    : is_capturing_depth_(false),
+       device_name_(device_name),
++      state_(kIdle),
+       pxc_capture_thread_("PxcCaptureThread") {
++  DLOG(INFO) << device_name.name() << ": " << device_name.id();
++  if (device_name.id() == kVirtualDepthDeviceId) {
++    is_capturing_depth_ = true;
++    const CommandLine* cmd_line = CommandLine::ForCurrentProcess();
++    std::string encoding_option(
++        cmd_line->GetSwitchValueASCII(switches::kDepthEncoding));
++    if (encoding_option == kDepthEncodingGrayscale) {
++      depth_encoding_ = kGrayscaleRGB32;
++    } else if (encoding_option == kDepthEncodingRaw) {
++      depth_encoding_ = kRawRGB32;
++    } else if (encoding_option == kDepthEncodingAdaptive) {
++      depth_encoding_ = kAdaptiveRGB32;
++    } else {
++      depth_encoding_ = kGrayscaleRGB32;
++    }
++  }
+ }
+ 
+ VideoCaptureDevicePxcWin::~VideoCaptureDevicePxcWin() {
+@@ -125,8 +171,13 @@ bool VideoCaptureDevicePxcWin::Init() {
+         break;
+       }
+ 
+-      if (base::WideToUTF8(std::wstring(device_info.name)) != device_name_.name() ||
+-          base::WideToUTF8(std::wstring(device_info.did)) != device_name_.id())
++      std::string device_name = device_name_.name();
++      std::string device_id = device_name_.id();
++      if (is_capturing_depth_) {
++        device_id = g_real_depth_device_id;
++      }
++      if (base::WideToUTF8(std::wstring(device_info.name)) != device_name ||
++          base::WideToUTF8(std::wstring(device_info.did)) != device_id)
+         continue;
+ 
+       PXCSmartPtr<PXCCapture::Device> device;
+@@ -190,10 +241,17 @@ void VideoCaptureDevicePxcWin::OnAllocateAndStart(
+       break;
+     }
+ 
+-    if (stream_info.cuid != PXCCapture::VideoStream::CUID ||
++    if (stream_info.cuid != PXCCapture::VideoStream::CUID)
++      continue;
++
++    if (!is_capturing_depth_ &&
+         stream_info.imageType != PXCImage::IMAGE_TYPE_COLOR)
+       continue;
+ 
++    if (is_capturing_depth_ &&
++        stream_info.imageType != PXCImage::IMAGE_TYPE_DEPTH)
++      continue;
++
+     PXCSmartPtr<PXCCapture::VideoStream> stream;
+     status =
+         device_->CreateStream<PXCCapture::VideoStream>(stream_index,
+@@ -258,6 +316,14 @@ void VideoCaptureDevicePxcWin::OnAllocateAndStart(
+     capture_format_.frame_rate = frame_rate;
+     capture_format_.pixel_format = PIXEL_FORMAT_ARGB;
+ 
++    if (is_capturing_depth_) {
++      GetDepthDeviceProperties();
++      depth_rgb32_image_.reset(
++          new uint8[capture_format_.frame_size.width() *
++                    capture_format_.frame_size.height() *
++                    kBytesPerPixelRGB32]);
++    }
++
+     // Start capturing.
+     state_ = kCapturing;
+     pxc_capture_thread_.message_loop()->PostTask(
+@@ -276,6 +342,7 @@ void VideoCaptureDevicePxcWin::OnStopAndDeAllocate() {
+   stream_.ReleaseRef();
+   device_.ReleaseRef();
+   client_.reset();
++  depth_rgb32_image_.reset();
+ }
+ 
+ void VideoCaptureDevicePxcWin::OnCaptureTask() {
+@@ -306,8 +373,11 @@ void VideoCaptureDevicePxcWin::OnCaptureTask() {
+   }
+ 
+   PXCImage::ImageData data;
++  PXCImage::ColorFormat format = PXCImage::COLOR_FORMAT_RGB32;
++  if (is_capturing_depth_)
++    format = PXCImage::COLOR_FORMAT_DEPTH;
+   status = image->AcquireAccess(
+-      PXCImage::ACCESS_READ, PXCImage::COLOR_FORMAT_RGB32, &data);
++      PXCImage::ACCESS_READ, format, &data);
+   if (status < PXC_STATUS_NO_ERROR) {
+     SetErrorState("Access image data error");
+     return;
+@@ -315,10 +385,11 @@ void VideoCaptureDevicePxcWin::OnCaptureTask() {
+ 
+   DCHECK_EQ(data.type, PXCImage::SURFACE_TYPE_SYSTEM_MEMORY);
+ 
+-  int length = info.width * info.height * kBytesPerPixelRGB32;
+-  client_->OnIncomingCapturedFrame(
+-      static_cast<uint8*> (data.planes[0]),
+-      length, base::TimeTicks::Now(), 0, capture_format_);
++  if (!is_capturing_depth_) {
++    CaptureColorImage(info, data);
++  } else {
++    CaptureDepthImage(info, data);
++  }
+ 
+   image->ReleaseAccess(&data);
+ 
+@@ -328,11 +399,152 @@ void VideoCaptureDevicePxcWin::OnCaptureTask() {
+                base::Unretained(this)));
+ }
+ 
++void VideoCaptureDevicePxcWin::GetDepthDeviceProperties() {
++  device_->QueryProperty(
++      PXCCapture::Device::PROPERTY_DEPTH_SATURATION_VALUE,
++      &depth_saturation_value_);
++  device_->QueryProperty(
++      PXCCapture::Device::PROPERTY_DEPTH_LOW_CONFIDENCE_VALUE,
++      &depth_low_confidence_value_);
++  device_->QueryProperty(
++      PXCCapture::Device::PROPERTY_DEPTH_UNIT,
++      &depth_unit_in_micrometers_);
++  device_->QueryPropertyAsRange(
++      PXCCapture::Device::PROPERTY_DEPTH_SENSOR_RANGE,
++      &depth_range_in_millimeters_);
++  DLOG(INFO) << "Depth Device Properties: "
++             << "\nPROPERTY_DEPTH_SATURATION_VALUE: "
++             << depth_saturation_value_
++             << "\nPROPERTY_DEPTH_LOW_CONFIDENCE_VALUE: "
++             << depth_low_confidence_value_
++             << "\nPROPERTY_DEPTH_UNIT: "
++             << depth_unit_in_micrometers_
++             << "\nPROPERTY_DEPTH_SENSOR_RANGE: "
++             << depth_range_in_millimeters_.min << ":"
++             << depth_range_in_millimeters_.max;
++}
++
++
+ void VideoCaptureDevicePxcWin::SetErrorState(const std::string& reason) {
+   DVLOG(1) << reason;
+   state_ = kError;
+   client_->OnError(reason);
+ }
+ 
++void VideoCaptureDevicePxcWin::CaptureColorImage(
++    const PXCImage::ImageInfo& info, const PXCImage::ImageData& data) {
++  int length = info.width * info.height * kBytesPerPixelRGB32;
++  client_->OnIncomingCapturedFrame(
++      static_cast<uint8*> (data.planes[0]),
++      length, base::TimeTicks::Now(), 0, capture_format_);
++}
++
++void VideoCaptureDevicePxcWin::CaptureDepthImage(
++    const PXCImage::ImageInfo& info, const PXCImage::ImageData& data) {
++  unsigned int length = info.width * info.height;
++  uint8* rgb_data = depth_rgb32_image_.get();
++  memset(rgb_data, 0, sizeof(uint8) * length * kBytesPerPixelRGB32);
++  int16* depth_data = reinterpret_cast<int16*>(data.planes[0]);
++
++  if (depth_encoding_ == kGrayscaleRGB32) {
++    DepthToGrayscaleRGB32(depth_data, rgb_data, length);
++  } else if (depth_encoding_ == kRawRGB32) {
++    DepthToRawRGB32(depth_data, rgb_data, length);
++  } else if (depth_encoding_ == kAdaptiveRGB32) {
++    DepthToAdaptiveRGB32(depth_data, rgb_data, length);
++  }
++
++  client_->OnIncomingCapturedFrame(
++      rgb_data,
++      length, base::TimeTicks::Now(), 0, capture_format_);
++}
++
++void VideoCaptureDevicePxcWin::DepthToGrayscaleRGB32(
++    int16* depth, uint8* rgb, unsigned int length) {
++  for (unsigned int i = 0; i < length; i++) {
++    int16 raw_depth_value = depth[i];
++    if (raw_depth_value == depth_saturation_value_ ||
++        raw_depth_value == depth_low_confidence_value_) {
++      continue;
++    }
++    float depth_value_in_millimeters =
++        raw_depth_value * depth_unit_in_micrometers_ / 1000;
++    if (depth_value_in_millimeters > kMaxDepthValue) {
++      continue;
++    }
++
++    // Implement the algorithm as equation (4) in paper
++    // "3-D Video Representation Using Depth Maps".
++    float value = 255.0 *
++        ((1.0 / depth_value_in_millimeters -
++          1.0 / kMaxDepthValue) /
++         (1.0 / kMinDepthValue -
++          1.0 / kMaxDepthValue));
++
++    // Layout is BGRA.
++    rgb[i * kBytesPerPixelRGB32 + 0] = static_cast<uint8>(value);
++    rgb[i * kBytesPerPixelRGB32 + 1] = static_cast<uint8>(value);
++    rgb[i * kBytesPerPixelRGB32 + 2] = static_cast<uint8>(value);
++  }
++}
++
++void VideoCaptureDevicePxcWin::DepthToRawRGB32(
++    int16* depth, uint8* rgb, unsigned int length) {
++  for (unsigned int i = 0; i < length; i++) {
++    int16 d = depth[i];
++    if (d == depth_saturation_value_ ||
++        d == depth_low_confidence_value_) {
++      continue;
++    }
++
++    // Implement the BIT2 scheme in paper
++    // "Adapting Standard Video Codecs for Depth Streaming"
++    // (http://web4.cs.ucl.ac.uk/staff/j.kautz/publications/depth-streaming.pdf)
++    // Layout is BGRA.
++    rgb[i * kBytesPerPixelRGB32 + 0] =
++        static_cast<uint8>(((d & 0xFC00) >> 8) & 0xFF);
++    rgb[i * kBytesPerPixelRGB32 + 1] =
++        static_cast<uint8>(((d & 0x03E0) >> 2) & 0xFF);
++    rgb[i * kBytesPerPixelRGB32 + 2] =
++        static_cast<uint8>(((d & 0x001F) << 3) & 0xFF);
++  }
++}
++
++void VideoCaptureDevicePxcWin::DepthToAdaptiveRGB32(
++    int16* depth, uint8* rgb, unsigned int length) {
++  const double np = 512.0;
++  const double w = kMaxDepthValue;
++  double p = np / w;
++  for (unsigned int i = 0; i < length; i++) {
++    int16 d = depth[i];
++    if (d == depth_saturation_value_ ||
++        d == depth_low_confidence_value_) {
++      continue;
++    }
++
++    if (d > w) {
++      continue;
++    }
++
++    // Implement the depth ecoding schema described in paper
++    // "Adapting Standard Video Codecs for Depth Streaming"
++    // (http://web4.cs.ucl.ac.uk/staff/j.kautz/publications/depth-streaming.pdf)
++    double ld = (d + 0.5) / w;
++
++    double ha = fmod(ld / (p / 2.0), 2.0);
++    if (ha > 1.0)
++      ha = 2.0 - ha;
++
++    double hb = fmod((ld - p / 4.0) / (p / 2.0), 2.0);
++    if (hb > 1.0)
++      hb = 2.0 - hb;
++
++    // Layout is BGRA.
++    rgb[i * kBytesPerPixelRGB32 + 0] = static_cast<uint8>(255.0 * ld);
++    rgb[i * kBytesPerPixelRGB32 + 1] = static_cast<uint8>(255.0 * ha);
++    rgb[i * kBytesPerPixelRGB32 + 2] = static_cast<uint8>(255.0 * hb);
++  }
++}
++
+ }  // namespace media
+ 
+diff --git a/media/video/capture/win/video_capture_device_pxc_win.h b/media/video/capture/win/video_capture_device_pxc_win.h
+index d51fc0b..5d3bbd0 100644
+--- a/media/video/capture/win/video_capture_device_pxc_win.h
++++ b/media/video/capture/win/video_capture_device_pxc_win.h
+@@ -11,6 +11,7 @@
+ #include "pxcgesture.h"  // NOLINT(*)
+ #include "pxcsmartptr.h"  // NOLINT(*)
+ 
++#include "base/memory/scoped_ptr.h"
+ #include "base/threading/thread.h"
+ #include "media/video/capture/video_capture_device.h"
+ #include "media/video/capture/video_capture_types.h"
+@@ -47,6 +48,16 @@ class VideoCaptureDevicePxcWin : public VideoCaptureDevice {
+     kError  // Error reported by PXCCapture API.
+   };
+ 
++  enum DepthEncoding {
++    // Convert 16-bit depth value into 1 8-bit channel.
++    kGrayscaleRGB32,
++    // Map 16-bit depth value into 3 8-bit channels.
++    kRawRGB32,
++    // Implement the ecoding scheme proposed in paper
++    // "Adapting Standard Video Codecs for Depth Streaming"
++    kAdaptiveRGB32
++  };
++
+   // Called on the pxc_capture_thread_.
+   void OnAllocateAndStart(int width,
+                           int height,
+@@ -55,11 +66,21 @@ class VideoCaptureDevicePxcWin : public VideoCaptureDevice {
+   void OnStopAndDeAllocate();
+   void OnCaptureTask();
+ 
++  void GetDepthDeviceProperties();
+   void SetErrorState(const std::string& reason);
+-
++  void CaptureColorImage(const PXCImage::ImageInfo& info,
++                         const PXCImage::ImageData& data);
++  void CaptureDepthImage(const PXCImage::ImageInfo& info,
++                         const PXCImage::ImageData& data);
++  void DepthToGrayscaleRGB32(int16* depth, uint8* rgb, unsigned int length);
++  void DepthToRawRGB32(int16* depth, uint8* rgb, unsigned int length);
++  void DepthToAdaptiveRGB32(int16* depth, uint8* rgb, unsigned int length);
++
++  bool is_capturing_depth_;
+   InternalState state_;
+   scoped_ptr<VideoCaptureDevice::Client> client_;
+   Name device_name_;
++  DepthEncoding depth_encoding_;
+ 
+   // Thread used for reading data from the device.
+   base::Thread pxc_capture_thread_;
+@@ -69,6 +90,15 @@ class VideoCaptureDevicePxcWin : public VideoCaptureDevice {
+ 
+   VideoCaptureFormat capture_format_;
+ 
++  // Depth capturing properties.
++  pxcF32 depth_saturation_value_;
++  pxcF32 depth_low_confidence_value_;
++  pxcF32 depth_unit_in_micrometers_;
++  PXCRangeF32 depth_range_in_millimeters_;
++
++  // Depth image in RGB32 format.
++  scoped_ptr<uint8[]> depth_rgb32_image_;
++
+   DISALLOW_IMPLICIT_CONSTRUCTORS(VideoCaptureDevicePxcWin);
+ };
+ 
+-- 
+1.7.9.5
+
